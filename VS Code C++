@@ -1,0 +1,204 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <PCF8575.h>
+#include <AiEsp32RotaryEncoder.h>
+#include <LiquidCrystal_I2C.h>
+#include <ArduinoJson.h>
+
+// --- Encoder Pins ESP32-C3 Super Mini ore different ones ---
+AiEsp32RotaryEncoder encSpeed(1, 0, -1, -1, 4);
+AiEsp32RotaryEncoder encHdg  (2, 3, -1, -1, 4);
+AiEsp32RotaryEncoder encAlt  (6, 7, -1, -1, 4);
+AiEsp32RotaryEncoder encVS   (9, 8, -1, -1, 4);
+
+void IRAM_ATTR isrSpeed() { encSpeed.readEncoder_ISR(); }
+void IRAM_ATTR isrHdg()   { encHdg.readEncoder_ISR();   }
+void IRAM_ATTR isrAlt()   { encAlt.readEncoder_ISR();   }
+void IRAM_ATTR isrVS()    { encVS.readEncoder_ISR();    }
+
+// --- I2C: GPIO 4 = SDA, GPIO 5 = SCL ---
+PCF8575           expander(0x20, 4, 5);
+LiquidCrystal_I2C lcd1(0x26, 16, 2);
+LiquidCrystal_I2C lcd2(0x27, 16, 2);
+
+// --- Button Definitionen ---
+const uint8_t PIN_BTN_ALT = 10; // Physischer Knopf am 4. Encoder (jetzt ALT)
+const uint8_t PCF_BTN_VS  = 15; // Button am PCF (jetzt VS)
+
+// --- Simulator-Werte ---
+long drSpeed = 250, drHeading = 0, drAltitude = 10000, drVSpeed = 0;
+int  drMachMode = 0, drAP1 = 0, drATHR = 0;
+int  drAPPR = 0, drLOC = 0, drAltMode = 0;
+bool metricAlt = false, trkFpaMode = false;
+
+// --- Letzte Encoder-Werte ---
+long lastSpeed = 0, lastHdg = 0, lastAlt = 0, lastVS = 0;
+
+// --- Debounce ---
+const uint16_t DEBOUNCE_MS = 200;
+uint32_t lastPcfTime[16]  = {0};
+bool     lastPcfState[16];
+uint32_t lastAltTime  = 0;
+bool     lastAltState = HIGH;
+
+bool pcfPressed(uint8_t pin) {
+    bool cur = expander.digitalRead(pin);
+    if (cur == LOW && lastPcfState[pin] == HIGH && (millis() - lastPcfTime[pin] > DEBOUNCE_MS)) {
+        lastPcfTime[pin]  = millis();
+        lastPcfState[pin] = LOW;
+        return true;
+    }
+    if (cur == HIGH) lastPcfState[pin] = HIGH;
+    return false;
+}
+
+bool gpioPressed(uint8_t pin, uint32_t &lastTime, bool &lastState) {
+    bool cur = digitalRead(pin);
+    if (cur == LOW && lastState == HIGH && (millis() - lastTime > DEBOUNCE_MS)) {
+        lastTime  = millis();
+        lastState = LOW;
+        return true;
+    }
+    if (cur == HIGH) lastState = HIGH;
+    return false;
+}
+
+void setLed(uint8_t pin, bool on) { expander.digitalWrite(pin, on ? HIGH : LOW); }
+
+void sendEncoder(const char* name, long delta) {
+    JsonDocument doc;
+    doc["t"] = "e"; doc["n"] = name; doc["d"] = delta;
+    serializeJson(doc, Serial); Serial.println();
+}
+
+void sendCommand(const char* name) {
+    JsonDocument doc;
+    doc["t"] = "c"; doc["n"] = name;
+    serializeJson(doc, Serial); Serial.println();
+}
+
+void readSerial() {
+    if (!Serial.available()) return;
+    JsonDocument doc;
+    if (deserializeJson(doc, Serial) != DeserializationError::Ok) return;
+    if (doc.containsKey("spd"))  drSpeed    = doc["spd"];
+    if (doc.containsKey("hdg"))  drHeading  = doc["hdg"];
+    if (doc.containsKey("alt"))  drAltitude = doc["alt"];
+    if (doc.containsKey("vs"))   drVSpeed   = doc["vs"];
+    if (doc.containsKey("mach")) drMachMode = doc["mach"];
+    if (doc.containsKey("ap1"))  drAP1      = doc["ap1"];
+    if (doc.containsKey("athr")) drATHR     = doc["athr"];
+    if (doc.containsKey("appr")) drAPPR     = doc["appr"];
+    if (doc.containsKey("loc"))  drLOC      = doc["loc"];
+    if (doc.containsKey("altm")) drAltMode  = doc["altm"];
+}
+
+void updateDisplay() {
+    char buf[17];
+    lcd1.setCursor(0, 0);
+    if (drMachMode) snprintf(buf, 17, "SPD  M0.%02d      ", (int)(drSpeed % 100));
+    else            snprintf(buf, 17, "SPD  %3d kt     ", (int)drSpeed);
+    lcd1.print(buf);
+    lcd1.setCursor(0, 1);
+    snprintf(buf, 17, "HDG  %03d deg    ", (int)drHeading);
+    lcd1.print(buf);
+    lcd2.setCursor(0, 0);
+    if (metricAlt) snprintf(buf, 17, "ALT %5d m     ", (int)(drAltitude * 0.3048f));
+    else           snprintf(buf, 17, "ALT %5d ft    ", (int)drAltitude);
+    lcd2.print(buf);
+    lcd2.setCursor(0, 1);
+    snprintf(buf, 17, "V/S %+5d fpm  ", (int)drVSpeed);
+    lcd2.print(buf);
+}
+
+void updateLeds() {
+    setLed(8,  drAP1     > 0);
+    setLed(10, drATHR    > 0);
+    setLed(11, drAltMode > 0);
+    setLed(12, drAPPR    > 0);
+    setLed(13, drLOC     > 0);
+    setLed(14, !trkFpaMode);
+}
+
+void handleButtons() {
+    if (pcfPressed(0))  sendCommand("AP1");
+    if (pcfPressed(1))  sendCommand("AP2");
+    if (pcfPressed(2))  sendCommand("ATHR");
+    if (pcfPressed(3))  sendCommand("EXPED");
+    if (pcfPressed(4))  sendCommand("APPR");
+    if (pcfPressed(5))  sendCommand("LOC");
+    if (pcfPressed(6))  sendCommand("HDGVS");
+    
+    if (pcfPressed(7))  sendCommand("SPD_BTN");
+    if (pcfPressed(9))  sendCommand("HDG_BTN");
+    
+    // --- Der Tausch in der Logik ---
+    if (gpioPressed(PIN_BTN_ALT, lastAltTime, lastAltState)) {
+        sendCommand("ALT_BTN"); // GPIO 10 sendet jetzt Altitude
+    }
+    
+    if (pcfPressed(PCF_BTN_VS)) {
+        sendCommand("VS_BTN");  // PCF Pin 15 sendet jetzt V/S
+    }
+}
+
+void handleEncoders() {
+    if (encSpeed.encoderChanged()) {
+        long cur = encSpeed.readEncoder();
+        sendEncoder("SPD", cur - lastSpeed);
+        lastSpeed = cur;
+    }
+    if (encHdg.encoderChanged()) {
+        long cur = encHdg.readEncoder();
+        sendEncoder("HDG", cur - lastHdg);
+        lastHdg = cur;
+    }
+    if (encAlt.encoderChanged()) {
+        long cur = encAlt.readEncoder();
+        sendEncoder("ALT", cur - lastAlt);
+        lastAlt = cur;
+    }
+    if (encVS.encoderChanged()) {
+        long cur = encVS.readEncoder();
+        sendEncoder("VS", cur - lastVS);
+        lastVS = cur;
+    }
+}
+
+void setup() {
+    Serial.begin(115200);
+    delay(1000);
+
+    encSpeed.begin(); encSpeed.setup(isrSpeed); encSpeed.disableAcceleration();
+    encHdg.begin();   encHdg.setup(isrHdg);     encHdg.disableAcceleration();
+    encAlt.begin();   encAlt.setup(isrAlt);     encAlt.disableAcceleration();
+    encVS.begin();    encVS.setup(isrVS);       encVS.disableAcceleration();
+
+    uint8_t inputPins[]  = {0, 1, 2, 3, 4, 5, 6, 7, 9, 15};
+    uint8_t outputPins[] = {8, 10, 11, 12, 13, 14};
+    for (uint8_t p : inputPins)  expander.pinMode(p, INPUT_PULLUP);
+    for (uint8_t p : outputPins) expander.pinMode(p, OUTPUT);
+    for (uint8_t p : outputPins) expander.digitalWrite(p, LOW);
+    expander.begin();
+
+    for (int i = 0; i < 16; i++) lastPcfState[i] = HIGH;
+    pinMode(PIN_BTN_ALT, INPUT_PULLUP);
+
+    lcd1.init(); lcd1.backlight();
+    lcd2.init(); lcd2.backlight();
+    
+    Serial.println("Ready");
+}
+
+void loop() {
+    readSerial();
+    handleEncoders();
+    handleButtons();
+
+    static uint32_t lastDisp = 0;
+    if (millis() - lastDisp > 150) {
+        lastDisp = millis();
+        updateDisplay();
+        updateLeds();
+    }
+}
